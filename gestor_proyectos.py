@@ -5,7 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import datetime
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 import json
 import os
 from pathlib import Path
@@ -35,7 +35,7 @@ st.set_page_config(
 )
 
 # ==========================================
-# CLASE PROJECTMANAGER CON SQLITE (MEJORADA)
+# CLASE PROJECTMANAGER CON SQLITE (MEJORADA V4)
 # ==========================================
 class ProjectManager:
     def __init__(self, db_name="proyectos_db.sqlite3"):
@@ -50,11 +50,11 @@ class ProjectManager:
         return sqlite3.connect(self.db_name, check_same_thread=False)
 
     def init_db(self):
-        """Inicializar esquema de base de datos"""
+        """Inicializar esquema de base de datos y actualizar si es necesario"""
         conn = self.get_connection()
         cursor = conn.cursor()
         
-        # Tabla Proyectos
+        # Tabla Proyectos BASE
         cursor.execute('''
             CREATE TABLE IF NOT EXISTS projects (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -64,6 +64,16 @@ class ProjectManager:
                 settings TEXT
             )
         ''')
+        
+        # --- MIGRACIÓN: Intentar añadir columnas de fechas de proyecto si no existen ---
+        try:
+            cursor.execute("ALTER TABLE projects ADD COLUMN project_start_date TEXT")
+            cursor.execute("ALTER TABLE projects ADD COLUMN project_end_date TEXT")
+            conn.commit()
+            print("Base de datos actualizada con columnas de fechas de proyecto.")
+        except sqlite3.OperationalError:
+            # Las columnas ya existen, ignorar el error
+            pass
         
         # Tabla Actividades
         cursor.execute('''
@@ -101,9 +111,15 @@ class ProjectManager:
         
         for proj_row in projects_rows:
             proj_name = proj_row['name']
+            # Manejo seguro de las nuevas fechas de proyecto (pueden ser NULL)
+            p_start = proj_row['project_start_date'] if proj_row['project_start_date'] else ""
+            p_end = proj_row['project_end_date'] if proj_row['project_end_date'] else ""
+
             self.projects[proj_name] = {
                 "description": proj_row['description'],
                 "created_date": proj_row['created_date'],
+                "project_start_date": p_start,
+                "project_end_date": p_end,
                 "settings": json.loads(proj_row['settings']) if proj_row['settings'] else {
                     "currency": "€", "working_days": True, "auto_calculate": True
                 },
@@ -142,9 +158,10 @@ class ProjectManager:
                 "auto_calculate": True
             })
             
+            # Inicializamos las fechas de proyecto como vacías
             cursor.execute("""
-                INSERT INTO projects (name, description, created_date, settings)
-                VALUES (?, ?, ?, ?)
+                INSERT INTO projects (name, description, created_date, settings, project_start_date, project_end_date)
+                VALUES (?, ?, ?, ?, "", "")
             """, (name, description, datetime.now().strftime("%Y-%m-%d"), default_settings))
             
             conn.commit()
@@ -221,18 +238,26 @@ class ProjectManager:
             st.error(f"Error DB al borrar actividad: {e}")
             return False
 
-    def update_project_description(self, project_name, new_description):
-        """Actualizar solo la descripción del proyecto"""
+    def update_project_details(self, project_name, new_description, new_start_date, new_end_date):
+        """Actualizar descripción y fechas globales del proyecto"""
         try:
             conn = self.get_connection()
             cursor = conn.cursor()
-            cursor.execute("UPDATE projects SET description = ? WHERE name = ?", (new_description, project_name))
+            # Convertir fechas a string si no son None, si no cadena vacía
+            s_date_str = new_start_date.strftime("%Y-%m-%d") if new_start_date else ""
+            e_date_str = new_end_date.strftime("%Y-%m-%d") if new_end_date else ""
+
+            cursor.execute("""
+                UPDATE projects 
+                SET description = ?, project_start_date = ?, project_end_date = ? 
+                WHERE name = ?
+            """, (new_description, s_date_str, e_date_str, project_name))
             conn.commit()
             conn.close()
             self.load_projects_from_db()
             return True
         except Exception as e:
-            st.error(f"Error DB actualizando descripción: {e}")
+            st.error(f"Error DB actualizando detalles del proyecto: {e}")
             return False
 
     def update_activity(self, project_name, activity_id, updates):
@@ -241,11 +266,9 @@ class ProjectManager:
             conn = self.get_connection()
             cursor = conn.cursor()
             
-            # Construir la query de update dinámicamente
             fields = []
             values = []
             for key, value in updates.items():
-                # Mapear 'group' a '"group"' para SQL
                 db_key = '"group"' if key == 'group' else key
                 fields.append(f"{db_key} = ?")
                 values.append(value)
@@ -265,7 +288,6 @@ class ProjectManager:
             return False
     
     def calculate_project_metrics(self, project_name):
-        # Esta función trabaja sobre self.projects (memoria), así que no cambia.
         """Calcular métricas del proyecto"""
         if project_name not in self.projects:
             return None
@@ -273,27 +295,16 @@ class ProjectManager:
         activities = self.projects[project_name]["activities"]
         if not activities:
             return {
-                "total_activities": 0,
-                "completed_activities": 0,
-                "progress_percentage": 0,
-                "on_time_activities": 0,
-                "delayed_activities": 0,
-                "at_risk_activities": 0,
-                "total_budget": 0,
-                "actual_cost": 0,
-                "cost_variance": 0,
-                "average_delay_days": 0
+                "total_activities": 0, "completed_activities": 0, "progress_percentage": 0,
+                "on_time_activities": 0, "delayed_activities": 0, "at_risk_activities": 0,
+                "total_budget": 0, "actual_cost": 0, "cost_variance": 0, "average_delay_days": 0
             }
         
         today = datetime.now()
         total_budget = sum(a.get("budget_cost", 0) for a in activities)
         actual_cost = sum(a.get("actual_cost", 0) for a in activities)
-        
         completed = sum(1 for a in activities if a.get("progress", 0) == 100)
-        on_time = 0
-        delayed = 0
-        at_risk = 0
-        total_delay = 0
+        on_time, delayed, at_risk, total_delay = 0, 0, 0, 0
         
         for activity in activities:
             progress = activity.get("progress", 0)
@@ -301,25 +312,19 @@ class ProjectManager:
             real_end_str = activity.get("real_end_date", "")
             
             if end_date_str:
-                end_date_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
-                
-                # Si la actividad está completada, miramos la fecha real de fin
-                if progress == 100 and real_end_str:
-                     real_end_dt = datetime.strptime(real_end_str, "%Y-%m-%d")
-                     delay = (real_end_dt - end_date_dt).days
-                     if delay <= 0:
-                         on_time += 1
-                     else:
-                         delayed += 1
-                         total_delay += delay
-                # Si no está completada, comparamos con hoy
-                elif progress < 100:
-                    if today > end_date_dt:
-                        delayed += 1
-                        total_delay += (today - end_date_dt).days
-                    elif (end_date_dt - today).days <= 7:
-                        at_risk += 1
-        
+                try:
+                    end_date_dt = datetime.strptime(end_date_str, "%Y-%m-%d")
+                    if progress == 100 and real_end_str:
+                         real_end_dt = datetime.strptime(real_end_str, "%Y-%m-%d")
+                         delay = (real_end_dt - end_date_dt).days
+                         if delay <= 0: on_time += 1
+                         else: delayed += 1; total_delay += delay
+                    elif progress < 100:
+                        if today > end_date_dt:
+                            delayed += 1; total_delay += (today - end_date_dt).days
+                        elif (end_date_dt - today).days <= 7: at_risk += 1
+                except ValueError: pass # Ignorar fechas inválidas
+
         avg_delay = total_delay / len(activities) if activities else 0
         
         return {
@@ -343,372 +348,203 @@ if 'project_manager' not in st.session_state:
 if 'editing_activity_id' not in st.session_state:
     st.session_state.editing_activity_id = None
 
-# Funciones auxiliares
-def create_gantt_chart(project_name):
-    """Crear gráfico de Gantt"""
-    if project_name not in st.session_state.project_manager.projects:
-        return None
-    
-    activities = st.session_state.project_manager.projects[project_name]["activities"]
-    if not activities:
-        return None
-    
-    df = pd.DataFrame(activities)
-    
-    # Usar fecha real si existe para el Gantt, si no la planificada
-    df['plot_start'] = df.apply(lambda x: x['real_start_date'] if x['real_start_date'] else x['start_date'], axis=1)
-    df['plot_end'] = df.apply(lambda x: x['real_end_date'] if x['real_end_date'] else x['end_date'], axis=1)
+# --- FUNCIÓN AUXILIAR PARA DETERMINAR ESTADO AUTOMÁTICO ---
+def determine_status(progress):
+    if progress == 0: return "Pendiente"
+    elif progress == 100: return "Completado"
+    else: return "En Progreso"
 
-    
-    fig = px.timeline(
-        df,
-        x_start="plot_start",
-        x_end="plot_end",
-        y="name",
-        color="status",
-        title=f"Diagrama de Gantt - {project_name} (Basado en Fechas Reales si existen)",
-        color_discrete_map={
-            "Completado": "#2E8B57",
-            "En Progreso": "#FFD700",
-            "Pendiente": "#87CEEB",
-            "Retrasado": "#DC143C",
-            "En Riesgo": "#FF8C00"
-        },
-        hover_data=["start_date", "end_date", "real_start_date", "real_end_date", "progress"]
-    )
-    
+# Funciones auxiliares de Gráficos (Sin cambios mayores, solo robustez)
+def create_gantt_chart(project_name):
+    if project_name not in st.session_state.project_manager.projects: return None
+    activities = st.session_state.project_manager.projects[project_name]["activities"]
+    if not activities: return None
+    df = pd.DataFrame(activities)
+    # Usar fecha real si existe para el Gantt, si no la planificada. Validar que existan.
+    df['plot_start'] = df.apply(lambda x: x.get('real_start_date') if x.get('real_start_date') else x.get('start_date'), axis=1)
+    df['plot_end'] = df.apply(lambda x: x.get('real_end_date') if x.get('real_end_date') else x.get('end_date'), axis=1)
+    # Filtrar filas sin fechas válidas
+    df = df[df['plot_start'].astype(bool) & df['plot_end'].astype(bool)]
+    if df.empty: return None
+
+    fig = px.timeline(df, x_start="plot_start", x_end="plot_end", y="name", color="status",
+        title=f"Diagrama de Gantt - {project_name} (Prioriza Fechas Reales)",
+        color_discrete_map={"Completado": "#2E8B57", "En Progreso": "#FFD700", "Pendiente": "#87CEEB", "Retrasado": "#DC143C", "En Riesgo": "#FF8C00"})
     fig.update_yaxes(categoryorder="total ascending")
-    fig.update_layout(
-        height=400 + len(activities) * 20,
-        xaxis_title="Fecha",
-        yaxis_title="Actividades"
-    )
-    
+    fig.update_layout(height=400 + len(activities) * 20, xaxis_title="Fecha", yaxis_title="Actividades")
     return fig
 
 def create_s_curve(project_name):
-    """Crear Curva S del proyecto"""
-    if project_name not in st.session_state.project_manager.projects:
-        return None
-    
+    if project_name not in st.session_state.project_manager.projects: return None
     activities = st.session_state.project_manager.projects[project_name]["activities"]
-    if not activities:
-        return None
-    
+    if not activities: return None
     df = pd.DataFrame(activities)
+    # Filtrar actividades sin fecha de inicio planificada
+    df = df[df['start_date'].astype(bool)].copy()
+    if df.empty: return None
+
     df = df.sort_values('start_date')
-    
-    # Calcular acumulados
     df['cumulative_budget'] = df['budget_cost'].cumsum()
-    # Para el coste real, deberíamos usar la fecha real si es posible
+    
     df_real = df.copy()
-    # Si no tiene fecha real de inicio, usamos la planificada para ordenar
-    df_real['sort_date'] = df_real.apply(lambda x: x['real_start_date'] if x['real_start_date'] else x['start_date'], axis=1)
+    # Usar fecha real de inicio si existe para ordenar la curva real
+    df_real['sort_date'] = df_real.apply(lambda x: x.get('real_start_date') if x.get('real_start_date') else x.get('start_date'), axis=1)
     df_real = df_real.sort_values('sort_date')
     df_real['cumulative_actual'] = df_real['actual_cost'].cumsum()
     
     fig = go.Figure()
-    
-    # Curva planeada
-    fig.add_trace(go.Scatter(
-        x=df['start_date'],
-        y=df['cumulative_budget'],
-        mode='lines+markers',
-        name='Costo Planeado (Base Planificada)',
-        line=dict(color='blue', width=2)
-    ))
-    
-    # Curva real
-    fig.add_trace(go.Scatter(
-        x=df_real['sort_date'],
-        y=df_real['cumulative_actual'],
-        mode='lines+markers',
-        name='Costo Real (Base Real)',
-        line=dict(color='red', width=2)
-    ))
-    
-    fig.update_layout(
-        title=f"Curva S - {project_name}",
-        xaxis_title="Fecha",
-        yaxis_title="Costo Acumulado (€)",
-        height=400
-    )
-    
+    fig.add_trace(go.Scatter(x=df['start_date'], y=df['cumulative_budget'], mode='lines+markers', name='Costo Planeado (Base Planificada)', line=dict(color='blue', width=2)))
+    fig.add_trace(go.Scatter(x=df_real['sort_date'], y=df_real['cumulative_actual'], mode='lines+markers', name='Costo Real (Base Real)', line=dict(color='red', width=2)))
+    fig.update_layout(title=f"Curva S - {project_name}", xaxis_title="Fecha", yaxis_title="Costo Acumulado (€)", height=400)
     return fig
 
 def create_kpi_dashboard(project_name):
-    """Crear dashboard de KPIs"""
     metrics = st.session_state.project_manager.calculate_project_metrics(project_name)
-    if not metrics:
-        return None
+    if not metrics: return None
+    fig = make_subplots(rows=2, cols=2, subplot_titles=("Estado de Actividades", "Progreso del Presupuesto", "Distribución de Tiempo", "Tendencia de Progreso"),
+        specs=[[{"type": "pie"}, {"type": "bar"}], [{"type": "bar"}, {"type": "scatter"}]])
     
-    # Crear subplots
-    fig = make_subplots(
-        rows=2, cols=2,
-        subplot_titles=("Estado de Actividades", "Progreso del Presupuesto", 
-                      "Distribución de Tiempo", "Tendencia de Progreso"),
-        specs=[[{"type": "pie"}, {"type": "bar"}],
-               [{"type": "bar"}, {"type": "scatter"}]]
-    )
-    
-    # Gráfico de pastel - Estado de actividades
     labels = ['Completadas', 'En Progreso', 'Retrasadas', 'En Riesgo']
-    values = [
-        metrics["completed_activities"],
-        metrics["total_activities"] - metrics["completed_activities"] - metrics["delayed_activities"] - metrics["at_risk_activities"],
-        metrics["delayed_activities"],
-        metrics["at_risk_activities"]
-    ]
+    values = [metrics["completed_activities"], metrics["total_activities"] - metrics["completed_activities"] - metrics["delayed_activities"] - metrics["at_risk_activities"], metrics["delayed_activities"], metrics["at_risk_activities"]]
+    fig.add_trace(go.Pie(labels=labels, values=values, name="Estado"), row=1, col=1)
+    fig.add_trace(go.Bar(x=['Planeado', 'Real'], y=[metrics["total_budget"], metrics["actual_cost"]], name="Presupuesto", marker_color=['blue', 'red']), row=1, col=2)
+    fig.add_trace(go.Bar(x=['A Tiempo', 'Con Retraso'], y=[metrics["on_time_activities"], metrics["delayed_activities"]], name="Tiempo", marker_color=['green', 'orange']), row=2, col=1)
     
-    fig.add_trace(
-        go.Pie(labels=labels, values=values, name="Estado"),
-        row=1, col=1
-    )
-    
-    # Gráfico de barras - Presupuesto
-    fig.add_trace(
-        go.Bar(x=['Planeado', 'Real'], y=[metrics["total_budget"], metrics["actual_cost"]], 
-               name="Presupuesto", marker_color=['blue', 'red']),
-        row=1, col=2
-    )
-    
-    # Distribución de tiempo
-    fig.add_trace(
-        go.Bar(x=['A Tiempo', 'Con Retraso'], 
-               y=[metrics["on_time_activities"], metrics["delayed_activities"]],
-               name="Tiempo", marker_color=['green', 'orange']),
-        row=2, col=1
-    )
-    
-    # Tendencia de progreso (simulada)
-    dates = pd.date_range(start=datetime.now() - timedelta(days=30), 
-                         end=datetime.now(), freq='D')
+    dates = pd.date_range(start=datetime.now() - timedelta(days=30), end=datetime.now(), freq='D')
     progress = np.linspace(0, metrics["progress_percentage"], len(dates))
-    
-    fig.add_trace(
-        go.Scatter(x=dates, y=progress, mode='lines', name="Progreso"),
-        row=2, col=2
-    )
-    
+    fig.add_trace(go.Scatter(x=dates, y=progress, mode='lines', name="Progreso"), row=2, col=2)
     fig.update_layout(height=600, showlegend=False)
     return fig
 
 def generate_advanced_pdf_report(project_name):
-    """Generar informe PDF avanzado y profesional (CORREGIDO PARA WINDOWS)"""
-    if project_name not in st.session_state.project_manager.projects:
-        return None
-    
-    project = st.session_state.project_manager.projects[project_name]
-    activities = project["activities"]
-    metrics = st.session_state.project_manager.calculate_project_metrics(project_name)
-    
-    # Crear buffer para el PDF
-    buffer = io.BytesIO()
-    doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=20*mm, leftMargin=20*mm,
-                           topMargin=20*mm, bottomMargin=20*mm)
-    
-    # Estilos
-    styles = getSampleStyleSheet()
-    title_style = ParagraphStyle(
-        'CustomTitle',
-        parent=styles['Heading1'],
-        fontSize=24,
-        spaceAfter=30,
-        alignment=TA_CENTER,
-        textColor=colors.HexColor('#1a202c')
-    )
-    
-    heading_style = ParagraphStyle(
-        'CustomHeading',
-        parent=styles['Heading2'],
-        fontSize=16,
-        spaceAfter=12,
-        textColor=colors.HexColor('#2b6cb0')
-    )
-    
-    # Contenido del informe
-    story = []
-    
-    # Portada
-    story.append(Paragraph(f"INFORME EJECUTIVO", title_style))
-    story.append(Paragraph(f"{project_name}", title_style))
-    story.append(Spacer(1, 20))
-    
-    # Información del proyecto
-    story.append(Paragraph("Información General", heading_style))
-    project_info = f"""
-    <b>Fecha del Informe:</b> {datetime.now().strftime('%d/%m/%Y')}<br/>
-    <b>Descripción:</b> {project.get('description', 'N/A')}<br/>
-    <b>Fecha de Creación:</b> {project.get('created_date', 'N/A')}<br/>
-    <b>Total de Actividades:</b> {metrics['total_activities']}<br/>
-    <b>Actividades Completadas:</b> {metrics['completed_activities']}
-    """
-    story.append(Paragraph(project_info, styles['Normal']))
-    story.append(Spacer(1, 20))
-    
-    # Métricas principales
-    story.append(Paragraph("Métricas del Proyecto", heading_style))
-    
-    # Tabla de métricas
-    metrics_data = [
-        ['Métrica', 'Valor'],
-        ['Procentaje de Progreso', f"{metrics['progress_percentage']:.1f}%"],
-        ['Presupuesto Total', f"€{metrics['total_budget']:,.2f}"],
-        ['Costo Real', f"€{metrics['actual_cost']:,.2f}"],
-        ['Variación de Costo', f"€{metrics['cost_variance']:,.2f}"],
-        ['Actividades a Tiempo', metrics['on_time_activities']],
-        ['Actividades Retrasadas', metrics['delayed_activities']],
-        ['Actividades en Riesgo', metrics['at_risk_activities']],
-        ['Retraso Promedio (días)', f"{metrics['average_delay_days']:.1f}"]
-    ]
-    
-    metrics_table = Table(metrics_data, colWidths=[60*mm, 40*mm])
-    metrics_table.setStyle(TableStyle([
-        ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
-        ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
-        ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-        ('FONTSIZE', (0, 0), (-1, -1), 10),
-        ('BOTTOMPADDING', (0, 0), (-1, 0), 12),
-        ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f7fafc')),
-        ('GRID', (0, 0), (-1, -1), 1, colors.grey)
-    ]))
-    
-    story.append(metrics_table)
-    story.append(Spacer(1, 20))
-    
-    # Gráficos
-    story.append(Paragraph("Análisis Gráfico", heading_style))
-    
-    # Generar gráficos con matplotlib
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # Gráfico 1: Estado de actividades
-    status_labels = ['Completadas', 'En Progreso', 'Retrasadas', 'En Riesgo']
-    status_values = [
-        metrics["completed_activities"],
-        metrics["total_activities"] - metrics["completed_activities"] - metrics["delayed_activities"] - metrics["at_risk_activities"],
-        metrics["delayed_activities"],
-        metrics["at_risk_activities"]
-    ]
-    # Evitar error si no hay actividades
-    if sum(status_values) > 0:
-        ax1.pie(status_values, labels=status_labels, autopct='%1.1f%%', startangle=90)
-    else:
-        ax1.text(0.5, 0.5, "Sin datos", ha='center')
-    ax1.set_title('Distribución de Actividades')
-    
-    # Gráfico 2: Presupuesto vs Real
-    budget_categories = ['Planeado', 'Real']
-    budget_values = [metrics["total_budget"], metrics["actual_cost"]]
-    ax2.bar(budget_categories, budget_values, color=['blue', 'red'])
-    ax2.set_title('Presupuesto vs Costo Real')
-    ax2.set_ylabel('€')
-    
-    # Gráfico 3: Curva S
-    if activities:
-        df = pd.DataFrame(activities)
-        df = df.sort_values('start_date')
-        df['cumulative_budget'] = df['budget_cost'].cumsum()
-        ax3.plot(range(len(df)), df['cumulative_budget'], 'b-', label='Planeado')
-        df['cumulative_actual'] = df['actual_cost'].cumsum()
-        ax3.plot(range(len(df)), df['cumulative_actual'], 'r-', label='Real')
-        ax3.set_title('Curva S de Costos')
-        ax3.set_xlabel('Actividades')
-        ax3.set_ylabel('Costo Acumulado (€)')
-        ax3.legend()
-    else:
-         ax3.text(0.5, 0.5, "Sin datos", ha='center')
-    
-    # Gráfico 4: Timeline de actividades
-    if activities:
-        df = pd.DataFrame(activities)
-        # Asegurar que las fechas sean datetime
-        df['start_date'] = pd.to_datetime(df['start_date'])
-        df['end_date'] = pd.to_datetime(df['end_date'])
+    """Generar informe PDF avanzado (CORREGIDO PARA WINDOWS Y ERRORES)"""
+    try:
+        if project_name not in st.session_state.project_manager.projects: return None
+        project = st.session_state.project_manager.projects[project_name]
+        activities = project["activities"]
+        metrics = st.session_state.project_manager.calculate_project_metrics(project_name)
         
-        df['duration'] = df['end_date'] - df['start_date']
-        df['duration_days'] = df['duration'].dt.days
-        top_activities = df.nlargest(5, 'duration_days')[['name', 'duration_days']]
-        if not top_activities.empty:
-            ax4.barh(top_activities['name'], top_activities['duration_days'])
-        else:
-             ax4.text(0.5, 0.5, "Sin datos suficientes", ha='center')
-        ax4.set_title('Top 5 Actividades Más Largas')
-        ax4.set_xlabel('Duración (días)')
-    else:
-         ax4.text(0.5, 0.5, "Sin datos", ha='center')
-    
-    plt.tight_layout()
-    
-    # --- CORRECCIÓN WINERROR 32 USANDO DIRECTorio TEMPORAL ---
-    with tempfile.TemporaryDirectory() as tmpdir:
-        img_path = os.path.join(tmpdir, 'report_charts.png')
+        buffer = io.BytesIO()
+        doc = SimpleDocTemplate(buffer, pagesize=A4, rightMargin=20*mm, leftMargin=20*mm, topMargin=20*mm, bottomMargin=20*mm)
+        styles = getSampleStyleSheet()
+        title_style = ParagraphStyle('CustomTitle', parent=styles['Heading1'], fontSize=24, spaceAfter=30, alignment=TA_CENTER, textColor=colors.HexColor('#1a202c'))
+        heading_style = ParagraphStyle('CustomHeading', parent=styles['Heading2'], fontSize=16, spaceAfter=12, textColor=colors.HexColor('#2b6cb0'))
         
-        plt.savefig(img_path, dpi=150, bbox_inches='tight')
-        plt.close()
-        
-        img = Image(img_path, width=170*mm, height=120*mm)
-        story.append(img)
-        
+        story = []
+        story.append(Paragraph(f"INFORME EJECUTIVO", title_style))
+        story.append(Paragraph(f"{project_name}", title_style))
         story.append(Spacer(1, 20))
         
-        # Tabla detallada de actividades
-        story.append(Paragraph("Detalle de Actividades", heading_style))
+        # Obtener fechas del proyecto de forma segura
+        p_start = project.get('project_start_date', 'N/D')
+        p_end = project.get('project_end_date', 'N/D')
+
+        story.append(Paragraph("Información General", heading_style))
+        project_info = f"""
+        <b>Fecha del Informe:</b> {datetime.now().strftime('%d/%m/%Y')}<br/>
+        <b>Descripción:</b> {project.get('description', 'N/A')}<br/>
+        <b>Inicio Proyecto:</b> {p_start}<br/>
+        <b>Fin Proyecto:</b> {p_end}<br/>
+        <b>Total Actividades:</b> {metrics['total_activities']}<br/>
+        <b>Actividades Completadas:</b> {metrics['completed_activities']}
+        """
+        story.append(Paragraph(project_info, styles['Normal']))
+        story.append(Spacer(1, 20))
         
-        table_data = [['ID', 'Actividad', 'Inicio Plan.', 'Fin Plan.', 'Inicio Real', 'Fin Real', 'Progreso', 'Estado']]
+        # Métricas (sin cambios)
+        story.append(Paragraph("Métricas del Proyecto", heading_style))
+        metrics_data = [['Métrica', 'Valor'], ['Procentaje de Progreso', f"{metrics['progress_percentage']:.1f}%"], ['Presupuesto Total', f"€{metrics['total_budget']:,.2f}"], ['Costo Real', f"€{metrics['actual_cost']:,.2f}"], ['Variación de Costo', f"€{metrics['cost_variance']:,.2f}"], ['Actividades a Tiempo', metrics['on_time_activities']], ['Actividades Retrasadas', metrics['delayed_activities']], ['Actividades en Riesgo', metrics['at_risk_activities']], ['Retraso Promedio (días)', f"{metrics['average_delay_days']:.1f}"]]
+        metrics_table = Table(metrics_data, colWidths=[60*mm, 40*mm])
+        metrics_table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')), ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), ('ALIGN', (0, 0), (-1, -1), 'LEFT'), ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'), ('FONTSIZE', (0, 0), (-1, -1), 10), ('BOTTOMPADDING', (0, 0), (-1, 0), 12), ('BACKGROUND', (0, 1), (-1, -1), colors.HexColor('#f7fafc')), ('GRID', (0, 0), (-1, -1), 1, colors.grey)]))
+        story.append(metrics_table)
+        story.append(Spacer(1, 20))
         
-        for activity in activities:
-            table_data.append([
-                activity.get('id', ''),
-                activity.get('name', '')[:25],
-                activity.get('start_date', ''),
-                activity.get('end_date', ''),
-                activity.get('real_start_date', '') if activity.get('real_start_date') else '-',
-                activity.get('real_end_date', '') if activity.get('real_end_date') else '-',
-                f"{activity.get('progress', 0)}%",
-                activity.get('status', '')
-            ])
+        # Gráficos (Matplotlib) - Robusto contra datos vacíos
+        story.append(Paragraph("Análisis Gráfico", heading_style))
+        fig_mpl, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(12, 10))
         
-        activities_table = Table(table_data, colWidths=[10*mm, 40*mm, 22*mm, 22*mm, 22*mm, 22*mm, 15*mm, 22*mm])
-        activities_table.setStyle(TableStyle([
-            ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')),
-            ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke),
-            ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
-            ('ALIGN', (1, 1), (1, -1), 'LEFT'),
-            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
-            ('FONTSIZE', (0, 0), (-1, -1), 7), # Fuente más pequeña para que quepa
-            ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
-            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.white]),
-            ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)
-        ]))
+        status_values = [metrics["completed_activities"], metrics["total_activities"] - metrics["completed_activities"] - metrics["delayed_activities"] - metrics["at_risk_activities"], metrics["delayed_activities"], metrics["at_risk_activities"]]
+        if sum(status_values) > 0: ax1.pie(status_values, labels=['Completadas', 'En Progreso', 'Retrasadas', 'En Riesgo'], autopct='%1.1f%%', startangle=90)
+        else: ax1.text(0.5, 0.5, "Sin datos", ha='center')
+        ax1.set_title('Distribución de Actividades')
         
-        story.append(activities_table)
+        ax2.bar(['Planeado', 'Real'], [metrics["total_budget"], metrics["actual_cost"]], color=['blue', 'red'])
+        ax2.set_title('Presupuesto vs Costo Real (€)')
         
-        doc.build(story)
-        buffer.seek(0)
-        pdf_bytes = buffer.getvalue()
+        if activities:
+            df = pd.DataFrame(activities)
+            df = df[df['start_date'].astype(bool)].sort_values('start_date')
+            if not df.empty:
+                df['cumulative_budget'] = df['budget_cost'].cumsum()
+                ax3.plot(range(len(df)), df['cumulative_budget'], 'b-', label='Planeado')
+                df['cumulative_actual'] = df['actual_cost'].cumsum()
+                ax3.plot(range(len(df)), df['cumulative_actual'], 'r-', label='Real')
+                ax3.legend()
+            else: ax3.text(0.5, 0.5, "Sin fechas válidas", ha='center')
+        else: ax3.text(0.5, 0.5, "Sin datos", ha='center')
+        ax3.set_title('Curva S de Costos')
         
-    return pdf_bytes
+        if activities:
+            df = pd.DataFrame(activities)
+            df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
+            df['end_date'] = pd.to_datetime(df['end_date'], errors='coerce')
+            df = df.dropna(subset=['start_date', 'end_date'])
+            if not df.empty:
+                df['duration_days'] = (df['end_date'] - df['start_date']).dt.days
+                top_activities = df.nlargest(5, 'duration_days')
+                ax4.barh(top_activities['name'], top_activities['duration_days'])
+            else: ax4.text(0.5, 0.5, "Sin fechas válidas", ha='center')
+        else: ax4.text(0.5, 0.5, "Sin datos", ha='center')
+        ax4.set_title('Top 5 Actividades Más Largas (Días)')
+        
+        plt.tight_layout()
+        
+        # Uso seguro de directorio temporal para Windows
+        with tempfile.TemporaryDirectory() as tmpdir:
+            img_path = os.path.join(tmpdir, 'report_charts.png')
+            plt.savefig(img_path, dpi=150, bbox_inches='tight')
+            plt.close(fig_mpl) # Cerrar la figura explícitamente
+            
+            img = Image(img_path, width=170*mm, height=120*mm)
+            story.append(img)
+            story.append(Spacer(1, 20))
+            
+            # Tabla detallada
+            story.append(Paragraph("Detalle de Actividades", heading_style))
+            table_data = [['ID', 'Actividad', 'Inicio Plan.', 'Fin Plan.', 'Inicio Real', 'Fin Real', 'Progreso', 'Estado']]
+            for activity in activities:
+                table_data.append([
+                    activity.get('id', ''), activity.get('name', '')[:25],
+                    activity.get('start_date', '') if activity.get('start_date') else '-',
+                    activity.get('end_date', '') if activity.get('end_date') else '-',
+                    activity.get('real_start_date', '') if activity.get('real_start_date') else '-',
+                    activity.get('real_end_date', '') if activity.get('real_end_date') else '-',
+                    f"{activity.get('progress', 0)}%", activity.get('status', 'Pendiente')
+                ])
+            
+            activities_table = Table(table_data, colWidths=[10*mm, 40*mm, 22*mm, 22*mm, 22*mm, 22*mm, 15*mm, 22*mm])
+            activities_table.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#2b6cb0')), ('TEXTCOLOR', (0, 0), (-1, 0), colors.whitesmoke), ('ALIGN', (0, 0), (-1, -1), 'CENTER'), ('ALIGN', (1, 1), (1, -1), 'LEFT'), ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'), ('FONTSIZE', (0, 0), (-1, -1), 7), ('BOTTOMPADDING', (0, 0), (-1, 0), 8), ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.whitesmoke, colors.white]), ('GRID', (0, 0), (-1, -1), 0.5, colors.grey)]))
+            story.append(activities_table)
+            
+            doc.build(story)
+            buffer.seek(0)
+            return buffer.getvalue()
+            
+    except Exception as e:
+        st.error(f"Error crítico generando el PDF: {str(e)}")
+        return None
 
 # Interfaz principal
 def main():
-    st.title("🏗️ Gestor de Proyectos Avanzado")
+    st.title("🏗️ Gestor de Proyectos Avanzado V4")
     st.markdown("---")
     
     # Sidebar
     with st.sidebar:
         st.header("📋 Menú Principal")
-        
-        page = st.selectbox(
-            "Selecciona una opción:",
-            ["🏠 Dashboard", "📊 Gestionar Proyectos", "📈 Plan del Proyecto", 
-             "📋 Kanban", "📑 Generar Informe", "⚙️ Configuración"]
-        )
-        
+        page = st.selectbox("Selecciona una opción:", ["🏠 Dashboard", "📊 Gestionar Proyectos", "📈 Plan del Proyecto", "📋 Kanban", "📑 Generar Informe", "⚙️ Configuración"])
         st.markdown("---")
         st.header("📁 Proyectos")
-        
         projects = list(st.session_state.project_manager.projects.keys())
         if projects:
             selected_project = st.selectbox("Seleccionar Proyecto:", projects)
@@ -720,74 +556,34 @@ def main():
     # Contenido principal según página seleccionada
     if page == "🏠 Dashboard":
         st.header("📊 Dashboard Principal")
-        
         if selected_project:
             col1, col2, col3, col4 = st.columns(4)
-            
             metrics = st.session_state.project_manager.calculate_project_metrics(selected_project)
+            with col1: st.metric("Progreso Global", f"{metrics['progress_percentage']:.1f}%", delta=f"{metrics['completed_activities']}/{metrics['total_activities']} tareas")
+            with col2: st.metric("Presupuesto", f"€{metrics['total_budget']:,.0f}", delta=f"€{metrics['cost_variance']:,.0f}", delta_color="inverse" if metrics['cost_variance'] > 0 else "normal")
+            with col3: st.metric("Actividades a Tiempo", metrics['on_time_activities'], delta=f"{metrics['delayed_activities']} retrasadas")
+            with col4: st.metric("Retraso Promedio", f"{metrics['average_delay_days']:.1f} días", delta="Días")
             
-            with col1:
-                st.metric(
-                    "Progreso Global",
-                    f"{metrics['progress_percentage']:.1f}%",
-                    delta=f"{metrics['completed_activities']}/{metrics['total_activities']} tareas"
-                )
-            
-            with col2:
-                st.metric(
-                    "Presupuesto",
-                    f"€{metrics['total_budget']:,.0f}",
-                    delta=f"€{metrics['cost_variance']:,.0f}",
-                    delta_color="inverse" if metrics['cost_variance'] > 0 else "normal"
-                )
-            
-            with col3:
-                st.metric(
-                    "Actividades a Tiempo",
-                    metrics['on_time_activities'],
-                    delta=f"{metrics['delayed_activities']} retrasadas"
-                )
-            
-            with col4:
-                st.metric(
-                    "Retraso Promedio",
-                    f"{metrics['average_delay_days']:.1f} días",
-                    delta="Días"
-                )
-            
-            # Gráficos
             st.markdown("---")
-            
             col1, col2 = st.columns(2)
-            
             with col1:
                 fig = create_gantt_chart(selected_project)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                     st.info("Añade actividades para ver el diagrama de Gantt.")
-            
+                if fig: st.plotly_chart(fig, use_container_width=True)
+                else: st.info("Añade actividades con fechas válidas para ver el diagrama de Gantt.")
             with col2:
                 fig = create_s_curve(selected_project)
-                if fig:
-                    st.plotly_chart(fig, use_container_width=True)
-                else:
-                     st.info("Añade actividades con costes para ver la Curva S.")
+                if fig: st.plotly_chart(fig, use_container_width=True)
+                else: st.info("Añade actividades con fechas y costes para ver la Curva S.")
             
-            # Dashboard de KPIs
             st.markdown("---")
             st.subheader("📈 Análisis Detallado de KPIs")
             fig = create_kpi_dashboard(selected_project)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                 st.info("No hay datos suficientes para el análisis detallado.")
-        else:
-            st.info("Por favor, selecciona un proyecto para ver el dashboard")
+            if fig: st.plotly_chart(fig, use_container_width=True)
+            else: st.info("No hay datos suficientes para el análisis detallado.")
+        else: st.info("Por favor, selecciona un proyecto para ver el dashboard")
     
     elif page == "📊 Gestionar Proyectos":
         st.header("📊 Gestión de Proyectos")
-        
         tab1, tab2, tab3 = st.tabs(["Crear Proyecto", "Ver Proyectos", "Editar Proyecto"])
         
         with tab1:
@@ -795,74 +591,72 @@ def main():
                 st.subheader("🆕 Crear Nuevo Proyecto")
                 name = st.text_input("Nombre del Proyecto*")
                 description = st.text_area("Descripción")
-                
                 submitted = st.form_submit_button("Crear Proyecto")
                 if submitted and name:
                     if st.session_state.project_manager.create_project(name, description):
                         st.success(f"Proyecto '{name}' creado exitosamente")
                         st.rerun()
-                    else:
-                        st.error("El proyecto ya existe")
+                    else: st.error("El proyecto ya existe")
         
         with tab2:
             st.subheader("📋 Lista de Proyectos")
-            
             if projects:
                 for project_name in projects:
                     with st.expander(f"📁 {project_name}"):
                         project = st.session_state.project_manager.projects[project_name]
                         metrics = st.session_state.project_manager.calculate_project_metrics(project_name)
-                        
                         col1, col2, col3 = st.columns(3)
-                        
+                        # Mostrar fechas del proyecto si existen
+                        p_start = project.get('project_start_date', 'N/D')
+                        p_end = project.get('project_end_date', 'N/D')
                         with col1:
                             st.write(f"**Descripción:** {project.get('description', 'N/A')}")
-                            st.write(f"**Creado:** {project.get('created_date', 'N/A')}")
-                        
+                            st.caption(f"Inicio: {p_start} | Fin: {p_end}")
                         with col2:
                             st.write(f"**Actividades:** {metrics['total_activities']}")
                             st.write(f"**Progreso:** {metrics['progress_percentage']:.1f}%")
-                        
                         with col3:
                             st.write(f"**Presupuesto:** €{metrics['total_budget']:,.0f}")
                             st.write(f"**Costo Real:** €{metrics['actual_cost']:,.0f}")
-                        
                         if st.button(f"🗑️ Eliminar {project_name}", key=f"del_{project_name}"):
                             if st.session_state.project_manager.delete_project(project_name):
                                 st.success("Proyecto eliminado")
                                 st.rerun()
-            else:
-                st.info("No hay proyectos creados")
+            else: st.info("No hay proyectos creados")
         
         with tab3:
             if selected_project:
                 st.subheader(f"✏️ Editar Proyecto: {selected_project}")
-
                 project = st.session_state.project_manager.projects[selected_project]
 
-                # --- FORMULARIO 1: ACTUALIZAR DESCRIPCIÓN ---
-                with st.form("update_description_form"):
-                    st.markdown("#### 📝 Actualizar Descripción")
-                    new_description = st.text_area(
-                        "Descripción",
-                        value=project.get('description', ''),
-                        key="description_input"
-                    )
-                    submitted_desc = st.form_submit_button("Actualizar Descripción")
+                # --- FORMULARIO 1: ACTUALIZAR DETALLES DEL PROYECTO (Descripción y Fechas Globales) ---
+                with st.form("update_project_details_form"):
+                    st.markdown("#### 📝 Detalles Generales del Proyecto")
+                    new_description = st.text_area("Descripción", value=project.get('description', ''), key="desc_input")
+                    
+                    # Preparar fechas por defecto (manejar si están vacías en DB)
+                    try: def_start = datetime.strptime(project.get('project_start_date'), "%Y-%m-%d")
+                    except: def_start = None
+                    try: def_end = datetime.strptime(project.get('project_end_date'), "%Y-%m-%d")
+                    except: def_end = None
 
-                    if submitted_desc:
-                        if st.session_state.project_manager.update_project_description(selected_project, new_description):
-                             st.success("✅ Descripción actualizada exitosamente")
+                    col_p1, col_p2 = st.columns(2)
+                    with col_p1: new_project_start = st.date_input("Fecha Inicio Proyecto", value=def_start, key="p_start_input")
+                    with col_p2: new_project_end = st.date_input("Fecha Fin Proyecto", value=def_end, key="p_end_input")
+
+                    submitted_details = st.form_submit_button("Actualizar Detalles del Proyecto")
+
+                    if submitted_details:
+                        if st.session_state.project_manager.update_project_details(selected_project, new_description, new_project_start, new_project_end):
+                             st.success("✅ Detalles del proyecto actualizados")
                              st.rerun()
-                        else:
-                             st.error("Error al actualizar la descripción")
+                        else: st.error("Error al actualizar los detalles")
 
                 st.markdown("---")
 
-                # --- SECCIÓN DE EDICIÓN DE ACTIVIDAD (SI SE SELECCIONÓ UNA) ---
+                # --- SECCIÓN DE EDICIÓN DE ACTIVIDAD ---
                 if st.session_state.editing_activity_id:
                     st.markdown("#### ✏️ Editando Actividad")
-                    # Buscar la actividad que se está editando
                     activity_to_edit = next((act for act in project["activities"] if act["id"] == st.session_state.editing_activity_id), None)
                     
                     if activity_to_edit:
@@ -872,531 +666,260 @@ def main():
                                 edit_name = st.text_input("Nombre*", value=activity_to_edit["name"], key="edit_name")
                                 edit_group = st.selectbox("Grupo", ["INGENIERÍA", "OBRA CIVIL", "ELECTROMECÁNICO", "SUMINISTROS", "OTROS"], index=["INGENIERÍA", "OBRA CIVIL", "ELECTROMECÁNICO", "SUMINISTROS", "OTROS"].index(activity_to_edit["group"]), key="edit_group")
                             with col2:
-                                edit_start = st.date_input("Inicio Planificado", value=datetime.strptime(activity_to_edit["start_date"], "%Y-%m-%d"), key="edit_start")
-                                edit_end = st.date_input("Fin Planificado", value=datetime.strptime(activity_to_edit["end_date"], "%Y-%m-%d"), key="edit_end")
+                                try: edit_start = st.date_input("Inicio Planificado", value=datetime.strptime(activity_to_edit["start_date"], "%Y-%m-%d"), key="edit_start")
+                                except: edit_start = st.date_input("Inicio Planificado", key="edit_start")
+                                try: edit_end = st.date_input("Fin Planificado", value=datetime.strptime(activity_to_edit["end_date"], "%Y-%m-%d"), key="edit_end")
+                                except: edit_end = st.date_input("Fin Planificado", key="edit_end")
                             
                             col3, col4 = st.columns(2)
                             with col3:
-                                # Manejo seguro de fechas reales (pueden estar vacías)
-                                try:
-                                    default_real_start = datetime.strptime(activity_to_edit["real_start_date"], "%Y-%m-%d")
-                                except (ValueError, TypeError):
-                                    default_real_start = None
-
-                                try:
-                                    default_real_end = datetime.strptime(activity_to_edit["real_end_date"], "%Y-%m-%d")
-                                except (ValueError, TypeError):
-                                    default_real_end = None
-
-                                edit_real_start = st.date_input("Inicio Real", value=default_real_start, key="edit_real_start")
-                                edit_real_end = st.date_input("Fin Real", value=default_real_end, key="edit_real_end")
+                                try: def_r_start = datetime.strptime(activity_to_edit["real_start_date"], "%Y-%m-%d")
+                                except: def_r_start = None
+                                try: def_r_end = datetime.strptime(activity_to_edit["real_end_date"], "%Y-%m-%d")
+                                except: def_r_end = None
+                                edit_real_start = st.date_input("Inicio Real", value=def_r_start, key="edit_real_start")
+                                edit_real_end = st.date_input("Fin Real", value=def_r_end, key="edit_real_end")
                             with col4:
+                                # Slider de Progreso - Determina el estado automáticamente
                                 edit_progress = st.slider("Progreso (%)", 0, 100, activity_to_edit["progress"], key="edit_progress")
-                                edit_status = st.selectbox("Estado", ["Pendiente", "En Progreso", "Completado", "Retrasado", "En Riesgo"], index=["Pendiente", "En Progreso", "Completado", "Retrasado", "En Riesgo"].index(activity_to_edit["status"]), key="edit_status")
+                                # Se calcula el nuevo estado basado en el slider
+                                new_auto_status = determine_status(edit_progress)
+                                st.info(f"Estado automático: **{new_auto_status}**")
 
                             col5, col6 = st.columns(2)
-                            with col5:
-                                edit_budget = st.number_input("Presupuesto", min_value=0.0, value=activity_to_edit["budget_cost"], key="edit_budget")
-                            with col6:
-                                edit_actual = st.number_input("Costo Real", min_value=0.0, value=activity_to_edit["actual_cost"], key="edit_actual")
+                            with col5: edit_budget = st.number_input("Presupuesto", min_value=0.0, value=activity_to_edit["budget_cost"], key="edit_budget")
+                            with col6: edit_actual = st.number_input("Costo Real", min_value=0.0, value=activity_to_edit["actual_cost"], key="edit_actual")
 
                             submitted_edit = st.form_submit_button("Guardar Cambios")
                             
                             if submitted_edit:
                                 updates = {
-                                    "name": edit_name,
-                                    "group": edit_group,
-                                    "start_date": edit_start.strftime("%Y-%m-%d"),
-                                    "end_date": edit_end.strftime("%Y-%m-%d"),
+                                    "name": edit_name, "group": edit_group,
+                                    "start_date": edit_start.strftime("%Y-%m-%d"), "end_date": edit_end.strftime("%Y-%m-%d"),
                                     "real_start_date": edit_real_start.strftime("%Y-%m-%d") if edit_real_start else "",
                                     "real_end_date": edit_real_end.strftime("%Y-%m-%d") if edit_real_end else "",
                                     "progress": edit_progress,
-                                    "status": edit_status,
-                                    "budget_cost": edit_budget,
-                                    "actual_cost": edit_actual
+                                    "status": new_auto_status, # Usamos el estado calculado automáticamente
+                                    "budget_cost": edit_budget, "actual_cost": edit_actual
                                 }
                                 if st.session_state.project_manager.update_activity(selected_project, st.session_state.editing_activity_id, updates):
                                     st.success("Actividad actualizada.")
-                                    st.session_state.editing_activity_id = None # Salir del modo edición
+                                    st.session_state.editing_activity_id = None
                                     st.rerun()
-                                else:
-                                    st.error("Error al actualizar.")
+                                else: st.error("Error al actualizar.")
                         
                         if st.button("Cancelar Edición"):
                             st.session_state.editing_activity_id = None
                             st.rerun()
                     st.markdown("---")
 
-
-                # --- FORMULARIO 2: AÑADIR NUEVA ACTIVIDAD (Ahora con Inicio Real) ---
+                # --- FORMULARIO 2: AÑADIR NUEVA ACTIVIDAD (Estado Automático) ---
                 with st.form("add_activity_form"):
                     st.markdown("#### ➕ Añadir Nueva Actividad")
                     col1, col2 = st.columns(2)
-
                     with col1:
                         activity_name = st.text_input("Nombre de la Actividad*", key="act_name")
-                        activity_group = st.selectbox(
-                            "Grupo",
-                            ["INGENIERÍA", "OBRA CIVIL", "ELECTROMECÁNICO", "SUMINISTROS", "OTROS"],
-                            key="act_group"
-                        )
-
+                        activity_group = st.selectbox("Grupo", ["INGENIERÍA", "OBRA CIVIL", "ELECTROMECÁNICO", "SUMINISTROS", "OTROS"], key="act_group")
                     with col2:
                         start_date = st.date_input("Inicio Planificado", key="act_start")
                         end_date = st.date_input("Fin Planificado", key="act_end")
                     
                     col_real1, col_real2 = st.columns(2)
-                    with col_real1:
-                         # Inicio real opcional al crear
-                         real_start_date = st.date_input("Inicio Real (Opcional)", value=None, key="act_real_start")
-                    with col_real2:
-                         progress = st.slider("Progreso (%)", 0, 100, 0, key="act_progress")
-
+                    with col_real1: real_start_date = st.date_input("Inicio Real (Opcional)", value=None, key="act_real_start")
+                    with col_real2: 
+                        # Slider de Progreso
+                        progress = st.slider("Progreso (%)", 0, 100, 0, key="act_progress")
+                        # Determinar estado automáticamente
+                        auto_status = determine_status(progress)
+                        st.info(f"Estado inicial: **{auto_status}**")
 
                     col3, col4 = st.columns(2)
                     with col3:
                         budget_cost = st.number_input("Presupuesto", min_value=0.0, value=0.0, key="act_budget")
                         actual_cost = st.number_input("Costo Real", min_value=0.0, value=0.0, key="act_actual")
                     with col4:
-                        status = st.selectbox(
-                            "Estado",
-                            ["Pendiente", "En Progreso", "Completado", "Retrasado", "En Riesgo"],
-                            key="act_status"
-                        )
                         weight = st.number_input("Peso", min_value=1, value=1, key="act_weight")
 
                     submitted_activity = st.form_submit_button("Añadir Actividad")
 
                     if submitted_activity:
                         if activity_name:
-                            # Determinar fechas reales iniciales
                             r_start = real_start_date.strftime("%Y-%m-%d") if real_start_date else ""
-                            # Si el progreso es 100% al crear, asumimos que termina hoy si no se especifica otra cosa.
                             r_end = datetime.now().strftime("%Y-%m-%d") if progress == 100 else ""
-
+                            
                             new_activity = {
-                                "name": activity_name,
-                                "group": activity_group,
-                                "start_date": start_date.strftime("%Y-%m-%d"),
-                                "end_date": end_date.strftime("%Y-%m-%d"),
+                                "name": activity_name, "group": activity_group,
+                                "start_date": start_date.strftime("%Y-%m-%d"), "end_date": end_date.strftime("%Y-%m-%d"),
                                 "progress": progress,
-                                "status": status,
-                                "budget_cost": budget_cost,
-                                "actual_cost": actual_cost,
-                                "weight": weight,
-                                "real_start_date": r_start,
-                                "real_end_date": r_end
+                                "status": auto_status, # Usamos el estado calculado
+                                "budget_cost": budget_cost, "actual_cost": actual_cost, "weight": weight,
+                                "real_start_date": r_start, "real_end_date": r_end
                             }
-
                             if st.session_state.project_manager.add_activity(selected_project, new_activity):
                                 st.success(f"✅ Actividad '{activity_name}' añadida exitosamente")
                                 st.rerun()
-                            else:
-                                st.error("❌ Hubo un error al añadir la actividad.")
-                        else:
-                            st.error("⚠️ Por favor, introduce un nombre para la actividad.")
+                            else: st.error("❌ Hubo un error al añadir la actividad.")
+                        else: st.error("⚠️ Por favor, introduce un nombre para la actividad.")
 
-                # --- LISTA INTERACTIVA DE ACTIVIDADES EXISTENTES (Borrar y Editar) ---
+                # --- LISTA DE ACTIVIDADES EXISTENTES ---
                 st.markdown("---")
                 st.markdown("#### 📋 Actividades Existentes (Gestión)")
-
                 if project["activities"]:
-                    # Usamos columnas para hacer una lista interactiva en lugar de un dataframe estático
                     for activity in project["activities"]:
                         col1, col2, col3, col4, col5, col6 = st.columns([3, 2, 2, 1, 1, 1])
                         with col1:
                             st.write(f"**{activity['name']}**")
                             st.caption(f"Grupo: {activity['group']}")
-                        with col2:
-                            st.write(f"Plan: {activity['start_date']} -> {activity['end_date']}")
+                        with col2: st.write(f"Plan: {activity['start_date']} -> {activity['end_date']}")
                         with col3:
-                            # Mostrar fechas reales si existen
                             r_start = activity.get('real_start_date') if activity.get('real_start_date') else "(sin inicio)"
                             r_end = activity.get('real_end_date') if activity.get('real_end_date') else "(sin fin)"
                             st.write(f"Real: {r_start} -> {r_end}")
                         with col4:
                             st.write(f"{activity['progress']}%")
                             st.caption(activity['status'])
-                        
                         with col5:
-                            # Botón de EDITAR
                             if st.button("✏️", key=f"edit_{activity['id']}"):
                                 st.session_state.editing_activity_id = activity['id']
                                 st.rerun()
-                        
                         with col6:
-                            # Botón de BORRAR
                             if st.button("🗑️", key=f"del_act_{activity['id']}"):
                                 if st.session_state.project_manager.delete_activity(selected_project, activity['id']):
                                     st.success("Actividad eliminada")
-                                    # Si estábamos editando la que borramos, salir del modo edición
                                     if st.session_state.editing_activity_id == activity['id']:
                                         st.session_state.editing_activity_id = None
                                     st.rerun()
-                        st.divider() # Línea separadora entre actividades
-                else:
-                    st.info("No hay actividades en este proyecto")
-            else:
-                st.warning("Por favor, selecciona un proyecto para editar")
+                        st.divider()
+                else: st.info("No hay actividades en este proyecto")
+            else: st.warning("Por favor, selecciona un proyecto para editar")
     
     elif page == "📈 Plan del Proyecto":
         st.header("📈 Plan del Proyecto")
-        
         if selected_project:
-            # Gantt Chart
             st.subheader("📊 Diagrama de Gantt")
-            st.caption("Este diagrama prioriza las fechas REALES de inicio/fin si están disponibles.")
+            st.caption("Prioriza fechas REALES si existen.")
             fig = create_gantt_chart(selected_project)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                 st.info("Añade actividades para ver el diagrama de Gantt.")
+            if fig: st.plotly_chart(fig, use_container_width=True)
+            else: st.info("Añade actividades con fechas válidas.")
             
-            # Curva S
             st.subheader("📈 Curva S de Progreso")
-            st.caption("La línea roja (Coste Real) se basa en la fecha de inicio real si existe.")
             fig = create_s_curve(selected_project)
-            if fig:
-                st.plotly_chart(fig, use_container_width=True)
-            else:
-                 st.info("Añade actividades con costes para ver la Curva S.")
+            if fig: st.plotly_chart(fig, use_container_width=True)
+            else: st.info("Añade actividades con fechas planificadas y costes.")
             
-            # Tabla de planificación
             st.subheader("📋 Tabla de Planificación Detallada")
-            
             project = st.session_state.project_manager.projects[selected_project]
             if project["activities"]:
                 df = pd.DataFrame(project["activities"])
-                
-                # Asegurar formato de fecha para cálculos
+                # Lógica de retraso simplificada para visualización
                 today = datetime.now()
-                
-                # Cálculo de retraso (simplificado)
-                def calculate_delay(row):
+                def calculate_delay_status(row):
                     try:
-                        end_date_dt = datetime.strptime(row['end_date'], '%Y-%m-%d')
-                        if row['progress'] < 100 and today > end_date_dt:
-                            return (today - end_date_dt).days
-                        elif row['progress'] == 100 and row.get('real_end_date'):
-                             real_end_dt = datetime.strptime(row['real_end_date'], '%Y-%m-%d')
-                             delay = (real_end_dt - end_date_dt).days
-                             return delay if delay > 0 else 0
-                        return 0
-                    except:
-                        return 0
-
-                df['retraso_dias'] = df.apply(calculate_delay, axis=1)
-                
-                # Reordenar columnas para mejor visualización
-                cols = ['name', 'group', 'start_date', 'end_date', 'real_start_date', 'real_end_date', 'progress', 'status', 'retraso_dias']
-                st.dataframe(df[cols], use_container_width=True)
-            else:
-                st.info("No hay actividades planificadas")
-        else:
-            st.warning("Por favor, selecciona un proyecto")
+                        end_dt = datetime.strptime(row['end_date'], '%Y-%m-%d')
+                        if row['progress'] < 100 and today > end_dt: return "Retrasado"
+                        return row['status']
+                    except: return row['status']
+                df['estado_calc'] = df.apply(calculate_delay_status, axis=1)
+                cols = ['name', 'group', 'start_date', 'end_date', 'real_start_date', 'real_end_date', 'progress', 'estado_calc']
+                st.dataframe(df[cols].rename(columns={'estado_calc': 'Estado (Tiempo)'}), use_container_width=True)
+            else: st.info("No hay actividades planificadas")
+        else: st.warning("Por favor, selecciona un proyecto")
     
     elif page == "📋 Kanban":
         st.header("📋 Tablero Kanban")
-        
         if selected_project:
             project = st.session_state.project_manager.projects[selected_project]
-            
             if project["activities"]:
-                # Organizar actividades por estado
-                pendientes = [a for a in project["activities"] if a["status"] == "Pendiente"]
-                en_progreso = [a for a in project["activities"] if a["status"] == "En Progreso"]
-                completadas = [a for a in project["activities"] if a["status"] == "Completado"]
-                retrasadas = [a for a in project["activities"] if a["status"] == "Retrasado"]
-                en_riesgo = [a for a in project["activities"] if a["status"] == "En Riesgo"]
-                
+                # Clasificación simple basada en el estado guardado
+                states = {"Pendiente": [], "En Progreso": [], "Completado": []}
+                # Estados adicionales calculados (simplificado)
+                today = datetime.now()
+                retrasadas, en_riesgo = [], []
+
+                for a in project["activities"]:
+                    # Clasificación base
+                    if a["status"] in states: states[a["status"]].append(a)
+                    
+                    # Cálculos de riesgo/retraso si no está completada
+                    if a["progress"] < 100 and a["end_date"]:
+                        try:
+                            end_dt = datetime.strptime(a["end_date"], '%Y-%m-%d')
+                            if today > end_dt: retrasadas.append(a)
+                            elif (end_dt - today).days <= 7: en_riesgo.append(a)
+                        except: pass
+
                 col1, col2, col3, col4, col5 = st.columns(5)
-                
+                def render_card(activity, bg_color):
+                     st.markdown(f"""<div style="background-color: {bg_color}; padding: 10px; border-radius: 5px; margin: 5px 0;"><strong>{activity['name']}</strong><br/><small>{activity['group']} | {activity['progress']}%</small></div>""", unsafe_allow_html=True)
+
                 with col1:
-                    st.markdown("### 🔵 Pendiente")
-                    for activity in pendientes:
-                        with st.container():
-                            st.markdown(f"""
-                            <div style="background-color: #e3f2fd; padding: 10px; border-radius: 5px; margin: 5px 0;">
-                                <strong>{activity['name']}</strong><br/>
-                                <small>Grupo: {activity['group']}</small><br/>
-                                <small>Progreso: {activity['progress']}%</small>
-                            </div>
-                            """, unsafe_allow_html=True)
-                
+                    st.markdown("### 🔵 Pendiente"); [render_card(a, "#e3f2fd") for a in states["Pendiente"]]
                 with col2:
-                    st.markdown("### 🟡 En Progreso")
-                    for activity in en_progreso:
-                        with st.container():
-                            st.markdown(f"""
-                            <div style="background-color: #fff9c4; padding: 10px; border-radius: 5px; margin: 5px 0;">
-                                <strong>{activity['name']}</strong><br/>
-                                <small>Grupo: {activity['group']}</small><br/>
-                                <small>Progreso: {activity['progress']}%</small>
-                            </div>
-                            """, unsafe_allow_html=True)
-                
+                    st.markdown("### 🟡 En Progreso"); [render_card(a, "#fff9c4") for a in states["En Progreso"]]
                 with col3:
-                    st.markdown("### 🟢 Completado")
-                    for activity in completadas:
-                        with st.container():
-                            st.markdown(f"""
-                            <div style="background-color: #e8f5e9; padding: 10px; border-radius: 5px; margin: 5px 0;">
-                                <strong>{activity['name']}</strong><br/>
-                                <small>Grupo: {activity['group']}</small><br/>
-                                <small>Progreso: {activity['progress']}%</small>
-                            </div>
-                            """, unsafe_allow_html=True)
-                
+                    st.markdown("### 🟢 Completado"); [render_card(a, "#e8f5e9") for a in states["Completado"]]
                 with col4:
-                    st.markdown("### 🔴 Retrasado")
-                    for activity in retrasadas:
-                        with st.container():
-                            st.markdown(f"""
-                            <div style="background-color: #ffebee; padding: 10px; border-radius: 5px; margin: 5px 0;">
-                                <strong>{activity['name']}</strong><br/>
-                                <small>Grupo: {activity['group']}</small><br/>
-                                <small>Progreso: {activity['progress']}%</small>
-                            </div>
-                            """, unsafe_allow_html=True)
-                
+                    st.markdown("### 🔴 Retrasado (Calc.)"); [render_card(a, "#ffebee") for a in retrasadas]
                 with col5:
-                    st.markdown("### 🟠 En Riesgo")
-                    for activity in en_riesgo:
-                        with st.container():
-                            st.markdown(f"""
-                            <div style="background-color: #fff3e0; padding: 10px; border-radius: 5px; margin: 5px 0;">
-                                <strong>{activity['name']}</strong><br/>
-                                <small>Grupo: {activity['group']}</small><br/>
-                                <small>Progreso: {activity['progress']}%</small>
-                            </div>
-                            """, unsafe_allow_html=True)
-            else:
-                st.info("No hay actividades en este proyecto")
-        else:
-            st.warning("Por favor, selecciona un proyecto")
+                    st.markdown("### 🟠 En Riesgo (<7 días)"); [render_card(a, "#fff3e0") for a in en_riesgo]
+            else: st.info("No hay actividades en este proyecto")
+        else: st.warning("Por favor, selecciona un proyecto")
     
     elif page == "📑 Generar Informe":
-        st.header("📑 Generador de Informes Avanzado")
-        
+        st.header("📑 Generador de Informes")
         if selected_project:
-            st.subheader(f"📊 Informe del Proyecto: {selected_project}")
-            
-            # Opciones del informe
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                include_charts = st.checkbox("Incluir Gráficos", value=True)
-                include_kpis = st.checkbox("Incluir KPIs", value=True)
-                include_activities = st.checkbox("Incluir Detalle de Actividades", value=True)
-            
-            with col2:
-                report_format = st.selectbox("Formato del Informe", ["PDF", "Excel"])
-                report_type = st.selectbox(
-                    "Tipo de Informe",
-                    ["Ejecutivo", "Detallado", "Técnico", "Financiero"]
-                )
+            st.subheader(f"📊 Informe: {selected_project}")
+            report_format = st.selectbox("Formato", ["PDF", "Excel"])
             
             if st.button("🚀 Generar Informe"):
-                with st.spinner("Generando informe..."):
+                with st.spinner("Generando..."):
                     if report_format == "PDF":
-                        # Se llama a la función corregida
                         pdf_data = generate_advanced_pdf_report(selected_project)
                         if pdf_data:
-                            st.success("✅ Informe PDF generado exitosamente")
-                            
-                            st.download_button(
-                                label="📥 Descargar Informe PDF",
-                                data=pdf_data,
-                                file_name=f"Informe_{selected_project}_{datetime.now().strftime('%Y%m%d')}.pdf",
-                                mime="application/pdf"
-                            )
+                            st.success("✅ PDF generado")
+                            st.download_button("📥 Descargar PDF", data=pdf_data, file_name=f"Informe_{selected_project}_{datetime.now().strftime('%Y%m%d')}.pdf", mime="application/pdf")
                     else:
-                        # Generar Excel
+                        # Generar Excel (Simplificado)
                         project = st.session_state.project_manager.projects[selected_project]
                         df = pd.DataFrame(project["activities"])
-                        
-                        # Añadir métricas
-                        metrics = st.session_state.project_manager.calculate_project_metrics(selected_project)
-                        
-                        # Crear Excel con múltiples hojas
-                        with pd.ExcelWriter(f"Informe_{selected_project}_{datetime.now().strftime('%Y%m%d')}.xlsx", engine='openpyxl') as writer:
+                        buffer = io.BytesIO()
+                        with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                             df.to_excel(writer, sheet_name='Actividades', index=False)
-                            
-                            # Hoja de resumen
-                            summary_data = {
-                                'Métrica': [
-                                    'Progreso Global (%)',
-                                    'Total Actividades',
-                                    'Actividades Completadas',
-                                    'Presupuesto Total (€)',
-                                    'Costo Real (€)',
-                                    'Variación de Costo (€)',
-                                    'Actividades a Tiempo',
-                                    'Actividades Retrasadas',
-                                    'Retraso Promedio (días)'
-                                ],
-                                'Valor': [
-                                    f"{metrics['progress_percentage']:.1f}",
-                                    metrics['total_activities'],
-                                    metrics['completed_activities'],
-                                    f"{metrics['total_budget']:,.2f}",
-                                    f"{metrics['actual_cost']:,.2f}",
-                                    f"{metrics['cost_variance']:,.2f}",
-                                    metrics['on_time_activities'],
-                                    metrics['delayed_activities'],
-                                    f"{metrics['average_delay_days']:.1f}"
-                                ]
-                            }
-                            summary_df = pd.DataFrame(summary_data)
-                            summary_df.to_excel(writer, sheet_name='Resumen', index=False)
-                        
-                        st.success("✅ Informe Excel generado exitosamente")
-            
-            # Vista previa del informe
-            st.markdown("---")
-            st.subheader("👁️ Vista Previa del Informe")
-            
-            # Mostrar métricas principales
-            metrics = st.session_state.project_manager.calculate_project_metrics(selected_project)
-            
-            col1, col2, col3, col4 = st.columns(4)
-            
-            with col1:
-                st.metric("Progreso", f"{metrics['progress_percentage']:.1f}%")
-            with col2:
-                st.metric("Presupuesto", f"€{metrics['total_budget']:,.0f}")
-            with col3:
-                st.metric("Costo Real", f"€{metrics['actual_cost']:,.0f}")
-            with col4:
-                st.metric("Retraso Promedio", f"{metrics['average_delay_days']:.1f} días")
-            
-            # Gráficos de muestra
-            if include_charts:
-                col1, col2 = st.columns(2)
-                
-                with col1:
-                    fig = create_gantt_chart(selected_project)
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-                
-                with col2:
-                    fig = create_s_curve(selected_project)
-                    if fig:
-                        st.plotly_chart(fig, use_container_width=True)
-        else:
-            st.warning("Por favor, selecciona un proyecto para generar el informe")
+                        st.success("✅ Excel generado")
+                        st.download_button("📥 Descargar Excel", data=buffer.getvalue(), file_name=f"Informe_{selected_project}.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        else: st.warning("Selecciona un proyecto")
     
     elif page == "⚙️ Configuración":
-        st.header("⚙️ Configuración de la Aplicación")
-        
-        tab1, tab2, tab3 = st.tabs(["General", "Importar/Exportar", "Acerca de"])
-        
+        st.header("⚙️ Configuración y Datos")
+        tab1, tab2 = st.tabs(["Importar Excel", "Acerca de"])
         with tab1:
-            st.subheader("🎨 Configuración General")
-            
-            # Configuración de la aplicación
-            app_settings = {
-                "theme": st.selectbox("Tema", ["Claro", "Oscuro"]),
-                "language": st.selectbox("Idioma", ["Español", "Inglés"]),
-                "currency": st.selectbox("Moneda", ["€", "$", "£"]),
-                "date_format": st.selectbox("Formato de Fecha", ["DD/MM/YYYY", "MM/DD/YYYY", "YYYY-MM-DD"]),
-                "auto_save": st.checkbox("Guardado Automático", value=True),
-                "notifications": st.checkbox("Notificaciones", value=True)
-            }
-            
-            if st.button("💾 Guardar Configuración"):
-                st.success("Configuración guardada exitosamente")
-        
-        with tab2:
-            st.subheader("📁 Importar/Exportar Datos")
-            
-            # NOTA SOBRE IMPORTACIÓN DESDE CARPETA
-            st.info("""
-                ℹ️ **Nota sobre seguridad web:** Por razones de seguridad, las aplicaciones web no pueden acceder directamente a las carpetas de tu escritorio sin permiso. 
-                Para importar un proyecto, arrastra el archivo JSON o Excel desde tu carpeta al área de carga correspondiente a continuación.
-            """)
-
-            col1, col2 = st.columns(2)
-            
-            with col1:
-                st.markdown("#### 📤 Exportar Proyectos")
-                # NOTA: La exportación completa de JSON es compleja con bases de datos relacionales.
-                # Se desactiva temporalmente hasta la siguiente fase para evitar errores.
-                st.warning("La exportación masiva a JSON se habilitará en una versión futura.")
-
-            
-            with col2:
-                st.markdown("#### 📥 Importar Proyectos (JSON)")
-                st.warning("La importación masiva desde JSON se habilitará en una versión futura.")
-
-            
-            # Importar desde Excel (Simplificado para la nueva estructura DB)
-            st.markdown("#### 📊 Importar desde Excel")
-            st.caption("Arrastra aquí tu archivo Excel desde tu carpeta.")
-            excel_file = st.file_uploader("Sube un archivo Excel", type=["xlsx", "xls"])
-            
-            if excel_file is not None:
-                try:
-                    df = pd.read_excel(excel_file)
-                    st.dataframe(df.head())
-                    
-                    project_name = st.text_input("Nombre del nuevo proyecto:")
-                    
-                    if st.button("Importar a Proyecto"):
-                        if project_name:
-                            # 1. Crear el proyecto en la DB
-                            if st.session_state.project_manager.create_project(project_name):
-                                # 2. Convertir e insertar actividades
-                                for index, row in df.iterrows():
-                                    # Intentar parsear fechas del excel
-                                    start_d = str(row.get('Inicio', datetime.now().strftime('%Y-%m-%d')))
-                                    end_d = str(row.get('Fin', datetime.now().strftime('%Y-%m-%d')))
-                                    
-                                    activity = {
-                                        # El ID se genera en DB
-                                        "name": str(row.get('Tarea', f'Actividad {index+1}')),
-                                        "group": str(row.get('Grupo', 'General')),
-                                        "start_date": start_d,
-                                        "end_date": end_d,
-                                        "progress": int(row.get('Progreso', 0)),
-                                        "status": str(row.get('Estado', 'Pendiente')),
-                                        "budget_cost": float(row.get('Presupuesto', 0)),
-                                        "actual_cost": float(row.get('Coste Real', 0)),
-                                        "weight": int(row.get('Peso', 1)),
-                                        # Asumimos sin fechas reales al importar de excel simple
-                                        "real_start_date": "",
-                                        "real_end_date": ""
-                                    }
-                                    st.session_state.project_manager.add_activity(project_name, activity)
-                                
-                                st.success(f"Proyecto '{project_name}' importado exitosamente")
-                                st.rerun()
-                            else:
-                                st.error("El proyecto ya existe o hubo un error al crearlo.")
-                except Exception as e:
-                    st.error(f"Error al leer el archivo Excel: {e}")
-        
-        with tab3:
-            st.subheader("ℹ️ Acerca de")
-            st.markdown("""
-            ### Gestor de Proyectos Avanzado v3.1 (Edición Completa)
-            
-            **Novedades de esta versión:**
-            - ✨ **Edición Completa:** Ahora puedes editar todas las propiedades de una actividad existente (fechas, costes, progreso).
-            - 🗑️ **Borrado de Actividades:** Elimina actividades individuales si te equivocas.
-            - 📅 **Fechas Reales:** Inclusión de "Inicio Real" y "Fin Real" para un seguimiento más preciso.
-            
-            **Características Principales:**
-            - 🗄️ Base de Datos SQLite.
-            - 📊 Dashboard interactivo y Diagramas (Gantt/Curva S).
-            - 📑 Generador de informes PDF/Excel profesionales.
-            
-            **Desarrollado por:**
-            Ingeniería y Supervisión Técnica
-            
-            **Versión:** 3.1.0
-            **Última Actualización:** Diciembre 2024
-            """)
+            st.markdown("#### 📊 Importar Actividades desde Excel")
+            st.caption("Arrastra tu archivo Excel. Debe tener columnas como 'Tarea', 'Inicio', 'Fin', 'Progreso'.")
+            excel_file = st.file_uploader("Archivo Excel", type=["xlsx", "xls"])
+            if excel_file and selected_project:
+                if st.button(f"Importar a '{selected_project}'"):
+                    try:
+                        df = pd.read_excel(excel_file)
+                        count = 0
+                        for index, row in df.iterrows():
+                            start_d = str(row.get('Inicio', datetime.now().strftime('%Y-%m-%d')))[:10]
+                            end_d = str(row.get('Fin', datetime.now().strftime('%Y-%m-%d')))[:10]
+                            progress_val = int(row.get('Progreso', 0))
+                            activity = {
+                                "name": str(row.get('Tarea', f'Actividad {index+1}')),
+                                "group": str(row.get('Grupo', 'General')),
+                                "start_date": start_d, "end_date": end_d,
+                                "progress": progress_val,
+                                "status": determine_status(progress_val),
+                                "budget_cost": float(row.get('Presupuesto', 0)), "actual_cost": float(row.get('Coste Real', 0)), "weight": int(row.get('Peso', 1)),
+                                "real_start_date": "", "real_end_date": ""
+                            }
+                            if st.session_state.project_manager.add_activity(selected_project, activity): count +=1
+                        st.success(f"✅ Se importaron {count} actividades a '{selected_project}'.")
+                        st.rerun()
+                    except Exception as e: st.error(f"Error en importación: {e}")
+            elif excel_file and not selected_project: st.warning("Primero selecciona un proyecto en el menú lateral para importar.")
+        with tab3: st.markdown("### Gestor de Proyectos V4 (Final) \n Base de datos SQLite y generación robusta de informes.")
 
 if __name__ == "__main__":
     main()
